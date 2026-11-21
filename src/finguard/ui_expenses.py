@@ -1,0 +1,1004 @@
+"""Expenses tab: detailed expenses, summary, and category mappings."""
+
+from __future__ import annotations
+
+import calendar
+import re
+from datetime import date
+
+import polars as pl
+from nicegui import ui
+
+from finguard.config import (
+    add_mapping as config_add_mapping,
+)
+from finguard.config import (
+    get_all_mappings,
+    get_known_categories,
+    get_mapping,
+)
+from finguard.config import (
+    remove_mapping as config_remove_mapping,
+)
+from finguard.df_operations import (
+    Cashflow,
+    RecurringExpenses,
+    normalize_category_value,
+    resolve_category,
+)
+from finguard.paths import (
+    PRIMARIES_FILENAME,
+    SECONDARIES_FILENAME,
+    get_dbs_root,
+    get_year_summary_path,
+)
+from finguard.ui_helpers import (
+    _EXPENSE_COLUMNS,
+    _MONTH_NAMES,
+    _df_to_rows,
+    _safe_eval_expr,
+)
+from finguard.ui_plots import (
+    render_category_expenses_chart,
+    render_cumulative_expenses_pie,
+    render_monthly_expenses_chart,
+    render_monthly_expenses_pie,
+)
+
+print("Hello, world from ui_expenses.py")
+
+
+def build_expenses_tab(st, _refreshables):
+    """Build the Expenses tab content with sub-tabs.
+
+    Registers ``refresh_table`` and ``summary_content`` in *_refreshables*.
+    """
+
+    # -- data helpers --------------------------------------------------------
+
+    def _filtered_rows() -> list[dict]:
+        if st.de is None:
+            return []
+        df = st.de.expense_df.with_row_index("id")
+        if st.filter_name:
+            df = df.filter(
+                pl.col("expense_name").str.contains(f"(?i){re.escape(st.filter_name)}")
+            )
+        if st.filter_category:
+            pat = f"(?i){re.escape(st.filter_category)}"
+            df = df.filter(
+                pl.col("primary_category").str.contains(pat)
+                | pl.col("secondary_category").str.contains(pat)
+            )
+        if st.filter_amount_min is not None:
+            df = df.filter(pl.col("expense_amount") >= st.filter_amount_min)
+        if st.filter_amount_max is not None:
+            df = df.filter(pl.col("expense_amount") <= st.filter_amount_max)
+        rows = _df_to_rows(df)
+        for row in rows:
+            d = row.get("expense_date", "")
+            if isinstance(d, str) and len(d) >= 10:
+                row["expense_date"] = int(d[8:10])
+        return rows
+
+    def refresh_table():
+        expenses_table.rows = _filtered_rows()
+        expenses_table.update()
+
+    _refreshables["refresh_table"] = refresh_table
+
+    # -- row operations ------------------------------------------------------
+
+    def delete_row(row_id: int):
+        if st.de is None:
+            return
+        df = st.de.expense_df.with_row_index("_idx")
+        st.de.expense_df = df.filter(pl.col("_idx") != row_id).drop("_idx")
+        st.de.expense_df.write_parquet(st.de.expense_df_path)
+        st.de.update_all_summary_tables()
+        refresh_table()
+        ui.notify("Expense deleted", type="positive")
+
+    def save_edit(row_id: int, updates: dict):
+        if st.de is None:
+            return
+        df = st.de.expense_df.with_row_index("_idx")
+        for col, val in updates.items():
+            if col == "expense_date":
+                # If user entered just a day, construct full date
+                if isinstance(val, str) and val.isdigit():
+                    # Use st.year and st.month from app state
+                    full_date = date(st.year, st.month, int(val))
+                    val = full_date
+                elif isinstance(val, str):
+                    val = date.fromisoformat(val) if isinstance(val, str) else val
+                # pl.lit(date) can be inferred as Int32 in some Polars versions,
+                # corrupting the column dtype.  Explicit cast keeps it as Date.
+                lit_expr = pl.lit(val).cast(pl.Date)
+            else:
+                lit_expr = pl.lit(val)
+            df = df.with_columns(
+                pl.when(pl.col("_idx") == row_id)
+                .then(lit_expr)
+                .otherwise(pl.col(col))
+                .alias(col)
+            )
+        st.de.expense_df = df.drop("_idx")
+        st.de.expense_df.write_parquet(st.de.expense_df_path)
+        refresh_table()
+        ui.notify("Expense updated", type="positive")
+
+    # -- dialogs -------------------------------------------------------------
+
+    def open_edit_dialog(row: dict):
+        row_id = int(row["id"])
+        with ui.dialog() as dlg, ui.card().classes("w-96"):
+            ui.label("Edit Expense").classes("text-lg font-bold mb-2")
+            inp_name = ui.input("Name", value=row.get("expense_name", ""))
+            inp_date = ui.input("Day of the Month", value=row.get("expense_date", ""))
+            inp_amount = ui.input("Amount", value=str(row.get("expense_amount", 0)))
+            inp_cur = ui.input("Currency", value=row.get("currency", "E"))
+            inp_pri = ui.input(
+                "Primary Category", value=row.get("primary_category", "")
+            )
+            inp_sec = ui.input(
+                "Secondary Category", value=row.get("secondary_category", "")
+            )
+
+            def do_save():
+                if not inp_amount.value:
+                    ui.notify("Amount is required", type="warning")
+                    return
+                try:
+                    existing_pri = (
+                        set(
+                            v
+                            for v in st.de.expense_df["primary_category"]
+                            .drop_nulls()
+                            .to_list()
+                            if v
+                        )
+                        if st.de is not None
+                        else set()
+                    )
+                    existing_sec = (
+                        set(
+                            v
+                            for v in st.de.expense_df["secondary_category"]
+                            .drop_nulls()
+                            .to_list()
+                            if v
+                        )
+                        if st.de is not None
+                        else set()
+                    )
+                    amount = _safe_eval_expr(str(inp_amount.value))
+                    save_edit(
+                        row_id,
+                        {
+                            "expense_name": inp_name.value,
+                            "expense_date": inp_date.value,
+                            "expense_amount": amount,
+                            "currency": inp_cur.value,
+                            "expense_in_ref_currency": amount,
+                            "primary_category": resolve_category(
+                                inp_pri.value, existing_pri
+                            ),
+                            "secondary_category": resolve_category(
+                                inp_sec.value, existing_sec
+                            ),
+                        },
+                    )
+                    dlg.close()
+                except Exception as exc:
+                    ui.notify(str(exc), type="negative")
+
+            with ui.row().classes("mt-2"):
+                ui.button("Save", on_click=do_save)
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+        dlg.open()
+
+    def open_add_dialog():
+        today = date.today()
+
+        pri_cats_set: set[str] = set()
+        sec_cats_set: set[str] = set()
+
+        if st.de is not None:
+            pri_cats_set.update(
+                v
+                for v in st.de.expense_df["primary_category"].drop_nulls().to_list()
+                if v
+            )
+            sec_cats_set.update(
+                v
+                for v in st.de.expense_df["secondary_category"].drop_nulls().to_list()
+                if v
+            )
+
+        # Also include categories from cumulative summary tables across all years
+        try:
+            dbs_root = get_dbs_root()
+            for year_dir in dbs_root.iterdir():
+                if not year_dir.is_dir():
+                    continue
+
+                pri_path = year_dir / PRIMARIES_FILENAME
+                if pri_path.exists():
+                    cum = pl.read_parquet(str(pri_path))
+                    if "primary_category" in cum.columns:
+                        pri_cats_set.update(
+                            c
+                            for c in cum["primary_category"].to_list()
+                            if c and c != "Total"
+                        )
+
+                sec_path = year_dir / SECONDARIES_FILENAME
+                if sec_path.exists():
+                    cum = pl.read_parquet(str(sec_path))
+                    if "secondary_category" in cum.columns:
+                        sec_cats_set.update(
+                            c
+                            for c in cum["secondary_category"].to_list()
+                            if c and c != "Total"
+                        )
+        except Exception:
+            # If anything goes wrong reading summaries, fall back to month-only lists
+            pass
+
+        # Include manually registered categories
+        known = get_known_categories()
+        pri_cats_set.update(known.get("primary", []))
+        sec_cats_set.update(known.get("secondary", []))
+
+        pri_cats = sorted({normalize_category_value(c) for c in pri_cats_set})
+        sec_cats = sorted({normalize_category_value(c) for c in sec_cats_set})
+
+        with ui.dialog() as dlg, ui.card().classes("w-80 items-center"):
+            ui.label("Add Expense").classes("text-lg font-bold mb-2")
+            inp_name = ui.input("Expense Name").classes("w-64")
+            inp_day = ui.input("Day of the Month", value=str(today.day)).classes("w-64")
+            inp_amount = ui.input("Amount", value="").classes("w-64")
+            inp_cur = ui.input("Currency", value="E").classes("w-64")
+            inp_pri = ui.select(
+                options=pri_cats,
+                with_input=True,
+                label="Primary Category",
+                new_value_mode="add",
+            ).classes("w-64")
+            inp_sec = ui.select(
+                options=sec_cats,
+                with_input=True,
+                label="Secondary Category (optional)",
+                new_value_mode="add",
+            ).classes("w-64")
+
+            # Track raw typed text so that clicking "Add" without pressing Enter
+            # still captures the typed value (Quasar's @new-value only fires on Enter).
+            _pri_pending: dict[str, str] = {"value": ""}
+            _sec_pending: dict[str, str] = {"value": ""}
+
+            def _on_pri_input(e) -> None:
+                raw = (
+                    e.args
+                    if isinstance(e.args, str)
+                    else (e.args[0] if isinstance(e.args, list) and e.args else "")
+                )
+                if (
+                    raw
+                ):  # Don't clear on blur – Quasar fires "" when focus leaves the input
+                    _pri_pending["value"] = raw
+
+            def _on_sec_input(e) -> None:
+                raw = (
+                    e.args
+                    if isinstance(e.args, str)
+                    else (e.args[0] if isinstance(e.args, list) and e.args else "")
+                )
+                if (
+                    raw
+                ):  # Don't clear on blur – Quasar fires "" when focus leaves the input
+                    _sec_pending["value"] = raw
+
+            inp_pri.on("input-value", _on_pri_input)
+            inp_sec.on("input-value", _on_sec_input)
+
+            def on_name_blur():
+                mapping = get_mapping(inp_name.value)
+                if mapping:
+                    pri = normalize_category_value(mapping["primary_category"])
+                    sec = normalize_category_value(mapping["secondary_category"])
+                    if (
+                        pri
+                        and isinstance(inp_pri.options, list)
+                        and pri not in inp_pri.options
+                    ):
+                        inp_pri.options.append(pri)
+                    if (
+                        sec
+                        and isinstance(inp_sec.options, list)
+                        and sec not in inp_sec.options
+                    ):
+                        inp_sec.options.append(sec)
+                    inp_pri.value = pri
+                    inp_sec.value = sec
+                    inp_pri.update()
+                    inp_sec.update()
+                    ui.notify(f"Auto-mapped to {pri}", type="info")
+
+            inp_name.on("blur", on_name_blur)
+
+            def do_add():
+                if st.de is None:
+                    ui.notify("No data loaded", type="negative")
+                    return
+                if not inp_name.value:
+                    ui.notify("Expense name is required", type="warning")
+                    return
+                if not inp_day.value or not inp_amount.value:
+                    ui.notify("Day and amount are required", type="warning")
+                    return
+                try:
+                    # Fall back to pending typed text if the select value was never
+                    # confirmed with Enter (common when clicking "Add" directly).
+                    pri_val = inp_pri.value or _pri_pending["value"] or None
+                    sec_val = inp_sec.value or _sec_pending["value"] or None
+                    st.de.add_row(
+                        expense_name=inp_name.value,
+                        expense_day=int(inp_day.value),
+                        expense_amount=_safe_eval_expr(str(inp_amount.value)),
+                        currency=inp_cur.value,
+                        primary_category=resolve_category(pri_val, set(pri_cats))
+                        if pri_val
+                        else None,
+                        secondary_category=resolve_category(sec_val, set(sec_cats))
+                        if sec_val
+                        else None,
+                    )
+                    refresh_table()
+                    dlg.close()
+                    ui.notify("Expense added", type="positive")
+                except Exception as exc:
+                    ui.notify(str(exc), type="negative")
+
+            with ui.row().classes("mt-2"):
+                ui.button("Add", on_click=do_add)
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+        dlg.open()
+
+    def confirm_delete(row: dict):
+        name = row.get("expense_name", "")
+        amount = row.get("expense_amount", "")
+        with ui.dialog() as dlg, ui.card():
+            ui.label(f'Delete "{name}" ({amount})?').classes("text-base")
+            with ui.row().classes("mt-2"):
+                ui.button(
+                    "Delete",
+                    color="negative",
+                    on_click=lambda: (delete_row(int(row["id"])), dlg.close()),
+                )
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+        dlg.open()
+
+    # ========================================================================
+    # BUILD UI
+    # ========================================================================
+
+    with ui.tabs().classes("w-full") as exp_subtabs:
+        ui.tab("Detailed expenses").props("no-caps").classes("text-xl")
+        ui.tab("Summary").props("no-caps").classes("text-xl")
+        ui.tab("Recurring").props("no-caps").classes("text-xl")
+        ui.tab("Mappings expense-categories").props("no-caps").classes("text-xl")
+
+    with ui.tab_panels(exp_subtabs, value="Detailed expenses").classes("w-full"):
+        with ui.tab_panel("Detailed expenses"):
+            with ui.row().classes("w-full items-end gap-4 mb-4"):
+                ui.input(
+                    "Search name",
+                    on_change=lambda e: (
+                        setattr(st, "filter_name", e.value or ""),
+                        refresh_table(),
+                    ),
+                ).classes("w-48")
+                ui.input(
+                    "Filter category",
+                    on_change=lambda e: (
+                        setattr(st, "filter_category", e.value or ""),
+                        refresh_table(),
+                    ),
+                ).classes("w-48")
+                ui.number(
+                    "Min amount",
+                    on_change=lambda e: (
+                        setattr(st, "filter_amount_min", e.value),
+                        refresh_table(),
+                    ),
+                ).classes("w-32")
+                ui.number(
+                    "Max amount",
+                    on_change=lambda e: (
+                        setattr(st, "filter_amount_max", e.value),
+                        refresh_table(),
+                    ),
+                ).classes("w-32")
+                ui.button("Add Expense", icon="add", on_click=open_add_dialog)
+
+            expenses_table = ui.table(
+                columns=_EXPENSE_COLUMNS,
+                rows=[],
+                row_key="id",
+                pagination={"rowsPerPage": 50},
+            ).classes("w-full text-lg")
+
+            expenses_table.add_slot(
+                "body-cell-actions",
+                """
+                <q-td :props="props">
+                    <q-btn flat dense icon="edit" color="primary"
+                        @click="$parent.$emit('edit', props.row)" />
+                    <q-btn flat dense icon="delete" color="negative"
+                        @click="$parent.$emit('delete', props.row)" />
+                </q-td>
+                """,
+            )
+            expenses_table.on("edit", lambda e: open_edit_dialog(e.args))
+            expenses_table.on("delete", lambda e: confirm_delete(e.args))
+
+        # ===================== SUMMARY TAB ==================================
+        with ui.tab_panel("Summary"):
+            summary_kind = ui.toggle(["Primary", "Secondary"], value="Primary")
+
+            @ui.refreshable
+            def summary_content():
+                if st.de is None:
+                    return
+                kind = "primary" if summary_kind.value == "Primary" else "secondary"
+                cat_col = f"{kind}_category"
+
+                # -- monthly summary for selected month --
+                monthly = st.de.create_expenses_summary_table(cat_col)
+                ui.label(f"Monthly \u2014 {_MONTH_NAMES[st.month]} {st.year}").classes(
+                    "text-lg font-bold mt-4"
+                )
+                if monthly.height > 0:
+                    cols = [
+                        {
+                            "name": c,
+                            "label": c.replace("_", " ").title(),
+                            "field": c,
+                            "align": "left" if i == 0 else "right",
+                            "sortable": True,
+                        }
+                        for i, c in enumerate(monthly.columns)
+                    ]
+                    with ui.row().classes("w-full items-start gap-8"):
+                        with ui.column().classes("flex-1"):
+                            ui.table(
+                                columns=cols, rows=_df_to_rows(monthly), row_key="id"
+                            ).classes("w-full text-lg")
+                        with ui.column().classes("flex-1"):
+                            render_monthly_expenses_pie(st.de, kind)
+                else:
+                    ui.label("No data for this month.").classes("text-gray-500")
+
+                # -- cumulative year summary (if exists) --
+                fn = PRIMARIES_FILENAME if kind == "primary" else SECONDARIES_FILENAME
+                path = get_year_summary_path(st.year, fn)
+                if path.exists():
+                    ui.label(f"Cumulative \u2014 {st.year}").classes(
+                        "text-lg font-bold mt-6"
+                    )
+                    cum = pl.read_parquet(str(path))
+
+                    # Remove categories with zero expenses in all months
+                    month_cols = [
+                        c for c in cum.columns if "-" in c and c.split("-")[1].isdigit()
+                    ]
+                    if month_cols:
+                        all_zero = pl.all_horizontal(
+                            pl.col(c).fill_null(0) == 0 for c in month_cols
+                        )
+                        cum = cum.filter(~all_zero | (pl.col(cat_col) == "Total"))
+
+                    def _col_label(c: str) -> str:
+                        if "_" in c:
+                            return c.replace("_", " ").title()
+                        # Convert "YYYY-MM" to month name
+                        parts = c.split("-")
+                        if len(parts) == 2 and parts[1].isdigit():
+                            m = int(parts[1])
+                            if 1 <= m <= 12:
+                                return calendar.month_name[m]
+                        return c
+
+                    cols = [
+                        {
+                            "name": c,
+                            "label": _col_label(c),
+                            "field": c,
+                            "align": "left" if i == 0 else "right",
+                            "sortable": True,
+                        }
+                        for i, c in enumerate(cum.columns)
+                    ]
+                    with ui.row().classes("w-full items-start gap-8"):
+                        with ui.column().classes("flex-1"):
+                            ui.table(
+                                columns=cols, rows=_df_to_rows(cum), row_key="id"
+                            ).classes("w-full text-lg")
+                        with ui.column().classes("flex-1"):
+                            render_cumulative_expenses_pie(st.year, kind)
+
+                    # -- bar chart: compare up to 3 months --
+                    ui.label("Monthly Comparison Chart").classes(
+                        "text-lg font-bold mt-6 mb-2"
+                    )
+                    # Determine available months from the parquet columns
+                    available_months = {
+                        int(c.split("-")[1]): _MONTH_NAMES[int(c.split("-")[1])]
+                        for c in cum.columns
+                        if "-" in c and c.split("-")[1].isdigit()
+                    }
+                    # Default: select the current month (if available)
+                    default_sel = (
+                        [st.month]
+                        if st.month in available_months
+                        else list(available_months.keys())[:1]
+                    )
+
+                    chart_months_select = (
+                        ui.select(
+                            options=available_months,
+                            value=default_sel,
+                            label="Months to compare (max 3)",
+                            multiple=True,
+                        )
+                        .classes("w-72 mb-2")
+                        .props("use-chips")
+                    )
+
+                    chart_container = ui.column().classes("w-full")
+
+                    def _render_chart():
+                        chart_container.clear()
+                        selected = chart_months_select.value or []
+                        sel = sorted(selected)[:3]
+                        with chart_container:
+                            render_monthly_expenses_chart(
+                                year=st.year,
+                                months=sel,
+                                kind=kind,
+                            )
+
+                    chart_months_select.on_value_change(lambda _: _render_chart())
+                    _render_chart()
+
+                    # -- line chart: compare categories over months --
+                    ui.label("Compare Expenses").classes("text-lg font-bold mt-8 mb-2")
+                    all_categories = [c for c in cum[cat_col].to_list() if c != "Total"]
+                    default_cats = all_categories[:1]
+
+                    cat_line_select = (
+                        ui.select(
+                            options=all_categories,
+                            value=default_cats,
+                            label="Categories to compare (max 3)",
+                            multiple=True,
+                        )
+                        .classes("w-80 mb-2")
+                        .props("use-chips")
+                    )
+
+                    line_chart_container = ui.column().classes("w-full")
+
+                    def _render_line_chart():
+                        line_chart_container.clear()
+                        selected_cats = cat_line_select.value or []
+                        sel = selected_cats[:3]
+                        with line_chart_container:
+                            render_category_expenses_chart(
+                                year=st.year,
+                                categories=sel,
+                                kind=kind,
+                            )
+
+                    cat_line_select.on_value_change(lambda _: _render_line_chart())
+                    _render_line_chart()
+
+            summary_content()
+            _refreshables["summary_content"] = summary_content
+
+            summary_kind.on_value_change(lambda _: summary_content.refresh())
+
+            def update_summaries():
+                if st.de is None:
+                    return
+                st.de.update_all_summary_tables()
+                Cashflow(year=st.year).recompute()
+                summary_content.refresh()
+                _refreshables["cashflow_content"].refresh()
+                ui.notify("Summary tables updated", type="positive")
+
+            ui.button(
+                "Regenerate Summaries",
+                icon="refresh",
+                on_click=update_summaries,
+            ).classes("mt-4")
+
+        # ===================== RECURRING TAB ================================
+        with ui.tab_panel("Recurring"):
+
+            @ui.refreshable
+            def recurring_content():
+                rec = RecurringExpenses(year=st.year)
+
+                # -- Add recurring expense form --
+                pri_cats_set: set[str] = set()
+                sec_cats_set: set[str] = set()
+                if st.de is not None:
+                    pri_cats_set.update(
+                        v
+                        for v in st.de.expense_df["primary_category"]
+                        .drop_nulls()
+                        .to_list()
+                        if v
+                    )
+                    sec_cats_set.update(
+                        v
+                        for v in st.de.expense_df["secondary_category"]
+                        .drop_nulls()
+                        .to_list()
+                        if v
+                    )
+                try:
+                    dbs_root = get_dbs_root()
+                    for year_dir in dbs_root.iterdir():
+                        if not year_dir.is_dir():
+                            continue
+                        pri_path = year_dir / PRIMARIES_FILENAME
+                        if pri_path.exists():
+                            cum = pl.read_parquet(str(pri_path))
+                            if "primary_category" in cum.columns:
+                                pri_cats_set.update(
+                                    c
+                                    for c in cum["primary_category"].to_list()
+                                    if c and c != "Total"
+                                )
+                        sec_path = year_dir / SECONDARIES_FILENAME
+                        if sec_path.exists():
+                            cum = pl.read_parquet(str(sec_path))
+                            if "secondary_category" in cum.columns:
+                                sec_cats_set.update(
+                                    c
+                                    for c in cum["secondary_category"].to_list()
+                                    if c and c != "Total"
+                                )
+                except Exception:
+                    pass
+
+                # Include manually registered categories
+                known = get_known_categories()
+                pri_cats_set.update(known.get("primary", []))
+                sec_cats_set.update(known.get("secondary", []))
+
+                pri_cats = sorted({normalize_category_value(c) for c in pri_cats_set})
+                sec_cats = sorted({normalize_category_value(c) for c in sec_cats_set})
+
+                with ui.row().classes("items-end gap-4 mb-4"):
+                    new_name = ui.input("Expense Name").classes("w-48")
+                    new_day = ui.input("Day of Month", value="1").classes("w-24")
+                    new_amount = ui.input("Amount").classes("w-32")
+                    new_cur = ui.input("Currency", value="E").classes("w-20")
+                    new_pri = ui.select(
+                        options=pri_cats,
+                        with_input=True,
+                        label="Primary Category",
+                        new_value_mode="add",
+                    ).classes("w-48")
+                    new_sec = ui.select(
+                        options=sec_cats,
+                        with_input=True,
+                        label="Secondary Category",
+                        new_value_mode="add",
+                    ).classes("w-48")
+
+                    # Track raw typed text so clicking "Add Recurring" without
+                    # pressing Enter still captures the typed category value.
+                    _rec_pri_pending: dict[str, str] = {"value": ""}
+                    _rec_sec_pending: dict[str, str] = {"value": ""}
+
+                    def _on_rec_pri_input(e) -> None:
+                        raw = (
+                            e.args
+                            if isinstance(e.args, str)
+                            else (
+                                e.args[0] if isinstance(e.args, list) and e.args else ""
+                            )
+                        )
+                        if raw:  # Don't clear on blur – Quasar fires "" when focus leaves the input
+                            _rec_pri_pending["value"] = raw
+
+                    def _on_rec_sec_input(e) -> None:
+                        raw = (
+                            e.args
+                            if isinstance(e.args, str)
+                            else (
+                                e.args[0] if isinstance(e.args, list) and e.args else ""
+                            )
+                        )
+                        if raw:  # Don't clear on blur – Quasar fires "" when focus leaves the input
+                            _rec_sec_pending["value"] = raw
+
+                    new_pri.on("input-value", _on_rec_pri_input)
+                    new_sec.on("input-value", _on_rec_sec_input)
+
+                    def on_rec_name_blur():
+                        mapping = get_mapping(new_name.value)
+                        if mapping:
+                            pri = normalize_category_value(mapping["primary_category"])
+                            sec = normalize_category_value(
+                                mapping["secondary_category"]
+                            )
+                            if (
+                                pri
+                                and isinstance(new_pri.options, list)
+                                and pri not in new_pri.options
+                            ):
+                                new_pri.options.append(pri)
+                            if (
+                                sec
+                                and isinstance(new_sec.options, list)
+                                and sec not in new_sec.options
+                            ):
+                                new_sec.options.append(sec)
+                            new_pri.value = pri
+                            new_sec.value = sec
+                            new_pri.update()
+                            new_sec.update()
+
+                    new_name.on("blur", on_rec_name_blur)
+
+                    def do_add_recurring():
+                        if not new_name.value or not new_amount.value:
+                            ui.notify("Name and amount are required", type="warning")
+                            return
+                        try:
+                            # Fall back to pending typed text if Enter was not pressed.
+                            rec_pri_val = (
+                                new_pri.value or _rec_pri_pending["value"] or ""
+                            )
+                            rec_sec_val = (
+                                new_sec.value or _rec_sec_pending["value"] or ""
+                            )
+                            rec.add(
+                                expense_name=new_name.value,
+                                expense_day=int(new_day.value),
+                                expense_amount=_safe_eval_expr(str(new_amount.value)),
+                                currency=new_cur.value,
+                                primary_category=resolve_category(
+                                    rec_pri_val, set(pri_cats)
+                                )
+                                if rec_pri_val
+                                else "",
+                                secondary_category=resolve_category(
+                                    rec_sec_val, set(sec_cats)
+                                )
+                                if rec_sec_val
+                                else "",
+                            )
+                            ui.notify(
+                                f'Recurring "{new_name.value}" added', type="positive"
+                            )
+                            recurring_content.refresh()
+                        except Exception as exc:
+                            ui.notify(str(exc), type="negative")
+
+                    ui.button("Add Recurring", icon="add", on_click=do_add_recurring)
+
+                # -- Apply to current month button --
+                def do_apply():
+                    if st.de is None:
+                        ui.notify("No data loaded", type="negative")
+                        return
+                    rec_fresh = RecurringExpenses(year=st.year)
+                    if rec_fresh.df.height == 0:
+                        ui.notify("No recurring expenses defined", type="warning")
+                        return
+                    added = rec_fresh.apply_to_month(st.de)
+                    if added:
+                        refresh_table()
+                        ui.notify(
+                            f"Applied {len(added)} recurring expense(s): {', '.join(added)}",
+                            type="positive",
+                        )
+                    else:
+                        ui.notify(
+                            "All recurring expenses already present this month",
+                            type="info",
+                        )
+
+                ui.button(
+                    f"Apply to {_MONTH_NAMES[st.month]} {st.year}",
+                    icon="playlist_add",
+                    on_click=do_apply,
+                ).classes("mb-4")
+
+                # -- Table of existing recurring definitions --
+                if rec.df.height > 0:
+                    rcols = [
+                        {
+                            "name": "expense_name",
+                            "label": "Name",
+                            "field": "expense_name",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "expense_day",
+                            "label": "Day",
+                            "field": "expense_day",
+                            "align": "center",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "expense_amount",
+                            "label": "Amount",
+                            "field": "expense_amount",
+                            "align": "right",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "currency",
+                            "label": "Cur",
+                            "field": "currency",
+                            "align": "center",
+                        },
+                        {
+                            "name": "primary_category",
+                            "label": "Primary",
+                            "field": "primary_category",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "secondary_category",
+                            "label": "Secondary",
+                            "field": "secondary_category",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "actions",
+                            "label": "",
+                            "field": "actions",
+                            "align": "center",
+                        },
+                    ]
+                    rrows = [
+                        {"id": i, **row}
+                        for i, row in enumerate(rec.df.iter_rows(named=True))
+                    ]
+                    rt = ui.table(
+                        columns=rcols,
+                        rows=rrows,
+                        row_key="id",
+                    ).classes("w-full text-lg")
+                    rt.add_slot(
+                        "body-cell-actions",
+                        """
+                        <q-td :props="props">
+                            <q-btn flat dense icon="delete" color="negative"
+                                @click="$parent.$emit('delete', props.row)" />
+                        </q-td>
+                        """,
+                    )
+
+                    def do_delete_recurring(e):
+                        rec.remove(int(e.args["id"]))
+                        ui.notify("Recurring expense removed", type="positive")
+                        recurring_content.refresh()
+
+                    rt.on("delete", do_delete_recurring)
+                else:
+                    ui.label("No recurring expenses defined yet.").classes(
+                        "text-gray-500"
+                    )
+
+            recurring_content()
+
+        # ===================== MAPPINGS TAB =================================
+        with ui.tab_panel("Mappings expense-categories"):
+
+            @ui.refreshable
+            def mappings_content():
+                mappings = get_all_mappings()
+
+                with ui.row().classes("items-end gap-4 mb-4"):
+                    new_name = ui.input("Expense Name").classes("w-48")
+                    new_pri = ui.input("Primary Category").classes("w-48")
+                    new_sec = ui.input("Secondary Category").classes("w-48")
+
+                    def do_add_mapping():
+                        if not new_name.value or not new_pri.value:
+                            ui.notify(
+                                "Name and primary category are required",
+                                type="warning",
+                            )
+                            return
+                        try:
+                            config_add_mapping(
+                                new_name.value,
+                                new_pri.value,
+                                new_sec.value or "",
+                            )
+                            ui.notify(
+                                f'Mapping added for "{new_name.value}"',
+                                type="positive",
+                            )
+                            mappings_content.refresh()
+                        except ValueError as exc:
+                            ui.notify(str(exc), type="negative")
+
+                    ui.button("Add Mapping", icon="add", on_click=do_add_mapping)
+
+                if mappings:
+                    mcols = [
+                        {
+                            "name": "expense_name",
+                            "label": "Expense Name",
+                            "field": "expense_name",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "primary_category",
+                            "label": "Primary",
+                            "field": "primary_category",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "secondary_category",
+                            "label": "Secondary",
+                            "field": "secondary_category",
+                            "align": "left",
+                            "sortable": True,
+                        },
+                        {
+                            "name": "actions",
+                            "label": "",
+                            "field": "actions",
+                            "align": "center",
+                        },
+                    ]
+                    mrows = [
+                        {"id": i, "expense_name": name, **m}
+                        for i, (name, m) in enumerate(mappings.items())
+                    ]
+                    mt = ui.table(columns=mcols, rows=mrows, row_key="id").classes(
+                        "w-full text-lg"
+                    )
+                    mt.add_slot(
+                        "body-cell-actions",
+                        """
+                        <q-td :props="props">
+                            <q-btn flat dense icon="delete" color="negative"
+                                @click="$parent.$emit('delete', props.row)" />
+                        </q-td>
+                        """,
+                    )
+
+                    def do_delete_mapping(e):
+                        config_remove_mapping(e.args["expense_name"])
+                        ui.notify("Mapping removed", type="positive")
+                        mappings_content.refresh()
+
+                    mt.on("delete", do_delete_mapping)
+                else:
+                    ui.label("No mappings configured yet.").classes("text-gray-500")
+
+            mappings_content()
+
+    exp_subtabs.on_value_change(
+        lambda e: summary_content.refresh() if e.value == "Summary" else None
+    )
